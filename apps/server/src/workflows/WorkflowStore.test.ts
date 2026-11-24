@@ -7,26 +7,35 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import type * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 
 import WorkflowsMigration from "../persistence/Migrations/110_Workflows.ts";
+import WorkflowRunIndexesMigration from "../persistence/Migrations/112_WorkflowRunIndexes.ts";
 import * as MilestoneHub from "../milestones/MilestoneHub.ts";
 import * as WorkflowStore from "./WorkflowStore.ts";
 
 const withStore = <A, E>(
-  use: Effect.Effect<A, E, WorkflowStore.WorkflowStore | MilestoneHub.MilestoneHub>,
+  use: Effect.Effect<
+    A,
+    E,
+    WorkflowStore.WorkflowStore | MilestoneHub.MilestoneHub | SqlClient.SqlClient
+  >,
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-workflow-store-" });
     const database = NodeSqliteClient.layer({ filename: path.join(directory, "state.sqlite") });
-    const migrated = Layer.effectDiscard(WorkflowsMigration);
+    const migrated = Layer.effectDiscard(
+      Effect.andThen(WorkflowsMigration, WorkflowRunIndexesMigration),
+    );
     return yield* Effect.provide(
       use,
       WorkflowStore.layer.pipe(
         Layer.provideMerge(Layer.merge(migrated, MilestoneHub.layer)),
-        Layer.provide(database),
+        Layer.provideMerge(database),
       ),
     );
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped);
@@ -523,6 +532,71 @@ it.effect("tells the milestone hub of each run and question transition once", ()
           parentWorkflowRunId: null,
           ...news,
         })),
+      );
+    }),
+  ),
+);
+
+it.effect("reads that run on every change or sweep do not read every run", () =>
+  withStore(
+    Effect.gen(function* () {
+      const store = yield* WorkflowStore.WorkflowStore;
+      const sql = yield* SqlClient.SqlClient;
+      for (const [index, status] of ["skipped", "skipped", "completed", "running"].entries()) {
+        yield* store.runStarted({
+          runId: `r${index}`,
+          workflow: "intake",
+          version: 1,
+          engineTag: "intake@1",
+          idempotencyKey: `hook:${index}`,
+          input: {},
+        });
+        if (status !== "running") yield* store.runEnded(`r${index}`, status as never, null, null);
+      }
+      const reads = {
+        list: store.runs(undefined),
+        listOfStatus: store.runs("skipped"),
+        listOfWorkflow: store.runsWhere({ workflow: "intake" }),
+        listOfWorkflowStatus: store.runsWhere({ workflow: "intake", status: "completed" }),
+        listOfKeys: store.runsWhere({ workflow: "intake", keyPrefix: "hook:" }),
+        counts: store.counts,
+        unfinished: store.unfinished,
+        untold: store.untold,
+        waitsToWake: store.waitsToWake,
+      };
+      const plans: Record<string, ReadonlyArray<string>> = {};
+      for (const [name, read] of Object.entries(reads)) {
+        const statements: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+        yield* (read as Effect.Effect<unknown>).pipe(
+          Effect.provideService(Statement.CurrentTransformer, (statement) => {
+            statements.push(statement.compile());
+            return Effect.succeed(statement);
+          }),
+        );
+        plans[name] = (yield* Effect.forEach(statements, ([query, params]) =>
+          sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, params),
+        )).flatMap((plan) => plan.map((row) => row.detail));
+      }
+      for (const [name, plan] of Object.entries(plans)) {
+        // A scan of an index is fine: a partial one holds only the few rows it is for.
+        const scans = plan.filter((detail) => /^SCAN (workflow_runs|c|r)$/.test(detail));
+        assert.deepStrictEqual(scans, [], `${name}: ${JSON.stringify(plan)}`);
+      }
+      // A list of one status comes in index order, with no sort of every run of that status.
+      assert.isFalse(
+        plans.listOfStatus!.some((detail) => detail.includes("TEMP B-TREE")),
+        JSON.stringify(plans.listOfStatus),
+      );
+      // The list leaves skipped runs to their own index-ordered half.
+      assert.isTrue(
+        plans.list!.some((detail) => detail.includes("workflow_runs_listed")),
+        JSON.stringify(plans.list),
+      );
+      assert.deepStrictEqual(
+        (yield* store.runsWhere({ workflow: "intake", status: "skipped" })).map(
+          (run) => run.run_id,
+        ),
+        ["r1", "r0"],
       );
     }),
   ),
